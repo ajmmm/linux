@@ -21,12 +21,12 @@ struct netkit {
 	struct bpf_mprog_entry __rcu *active;
 	enum netkit_action policy;
 	enum netkit_scrub scrub;
+	bool primary;
 	struct bpf_mprog_bundle	bundle;
 	__cacheline_group_end(netkit_fastpath);
 
 	__cacheline_group_begin(netkit_slowpath);
 	enum netkit_mode mode;
-	bool primary;
 	u32 headroom;
 	__cacheline_group_end(netkit_slowpath);
 };
@@ -59,10 +59,12 @@ static void netkit_xnet(struct sk_buff *skb)
 }
 
 static void netkit_prep_forward(struct sk_buff *skb,
+				bool ingress,
 				bool xnet, bool xnet_scrub)
 {
 	skb_scrub_packet(skb, false);
 	nf_skip_egress(skb, true);
+	tcx_set_ingress(skb, ingress);
 	skb_reset_mac_header(skb);
 	if (!xnet)
 		return;
@@ -94,7 +96,7 @@ static netdev_tx_t netkit_xmit(struct sk_buff *skb, struct net_device *dev)
 		     skb_orphan_frags(skb, GFP_ATOMIC)))
 		goto drop;
 	netkit_prep_forward(skb, !net_eq(dev_net(dev), dev_net(peer)),
-			    nk->scrub);
+			    nk->scrub, !nk->primary);
 	eth_skb_pkt_type(skb, peer);
 	skb->dev = peer;
 	entry = rcu_dereference(nk->active);
