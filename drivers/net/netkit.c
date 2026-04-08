@@ -83,6 +83,7 @@ static netdev_tx_t netkit_xmit(struct sk_buff *skb, struct net_device *dev)
 	enum netkit_action ret = READ_ONCE(nk->policy);
 	netdev_tx_t ret_dev = NET_XMIT_SUCCESS;
 	const struct bpf_mprog_entry *entry;
+	bool at_ingress;
 	struct net_device *peer;
 	int len = skb->len;
 
@@ -98,8 +99,15 @@ static netdev_tx_t netkit_xmit(struct sk_buff *skb, struct net_device *dev)
 	eth_skb_pkt_type(skb, peer);
 	skb->dev = peer;
 	entry = rcu_dereference(nk->active);
-	if (entry)
+	if (entry) {
+		/* Peer-side programs run inline on transmit, but they operate on
+		 * traffic that is about to enter the remote netkit endpoint.
+		 */
+		at_ingress = skb_at_tc_ingress(skb);
+		tcx_set_ingress(skb, at_ingress || !nk->primary);
 		ret = netkit_run(entry, skb, ret);
+		tcx_set_ingress(skb, at_ingress);
+	}
 	switch (ret) {
 	case NETKIT_NEXT:
 	case NETKIT_PASS:

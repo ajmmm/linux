@@ -11,6 +11,9 @@
 #define ping_addr_noneigh	0x0a000003 /* 10.0.0.3 */
 
 #include "test_tc_link.skel.h"
+#include "test_tc_peer.skel.h"
+#include "test_tc_netkit_sk_assign.skel.h"
+#include "network_helpers.h"
 #include "netlink_helpers.h"
 #include "tc_helpers.h"
 
@@ -20,6 +23,17 @@
 #define MARK		42
 #define PRIO		0xeb9f
 #define ICMP_ECHO	8
+
+#define NETKIT_NS_FOO "ns_tc_netkit_foo"
+#define NETKIT_NS_BAR "ns_tc_netkit_bar"
+#define NETKIT_A_DEV "nk1"
+#define NETKIT_A_PEER "nk0"
+#define NETKIT_B_DEV "mk1"
+#define NETKIT_B_PEER "mk0"
+#define NETKIT_A_IP 0x0a000001 /* 10.0.0.1 */
+#define NETKIT_A_PEER_IP 0x0a000002 /* 10.0.0.2 */
+#define NETKIT_B_IP 0x0a000101 /* 10.0.1.1 */
+#define NETKIT_B_PEER_IP 0x0a000102 /* 10.0.1.2 */
 
 #define FLAG_ADJUST_ROOM (1 << 0)
 #define FLAG_SAME_NETNS  (1 << 1)
@@ -40,8 +54,10 @@ struct iplink_req {
 	char             buf[1024];
 };
 
-static int create_netkit(int mode, int policy, int peer_policy, int *ifindex,
-			 int scrub, int peer_scrub, __u32 flags)
+static int create_netkit_named(const char *prim, const char *peer,
+			       int mode, int policy, int peer_policy,
+			       int *ifindex, int scrub, int peer_scrub,
+			       __u32 flags)
 {
 	struct rtnl_handle rth = { .fd = -1 };
 	struct iplink_req req = {};
@@ -59,8 +75,7 @@ static int create_netkit(int mode, int policy, int peer_policy, int *ifindex,
 	req.n.nlmsg_type = RTM_NEWLINK;
 	req.i.ifi_family = AF_UNSPEC;
 
-	addattr_l(&req.n, sizeof(req), IFLA_IFNAME, netkit_name,
-		  strlen(netkit_name));
+	addattr_l(&req.n, sizeof(req), IFLA_IFNAME, prim, strlen(prim));
 	linkinfo = addattr_nest(&req.n, sizeof(req), IFLA_LINKINFO);
 	addattr_l(&req.n, sizeof(req), IFLA_INFO_KIND, type, strlen(type));
 	data = addattr_nest(&req.n, sizeof(req), IFLA_INFO_DATA);
@@ -79,9 +94,23 @@ static int create_netkit(int mode, int policy, int peer_policy, int *ifindex,
 	err = rtnl_talk(&rth, &req.n, NULL);
 	ASSERT_OK(err, "talk_rtnetlink");
 	rtnl_close(&rth);
-	*ifindex = if_nametoindex(netkit_name);
+	*ifindex = if_nametoindex(prim);
 
 	ASSERT_GT(*ifindex, 0, "retrieve_ifindex");
+	return err;
+}
+
+static int create_netkit(int mode, int policy, int peer_policy, int *ifindex,
+			 int scrub, int peer_scrub, __u32 flags)
+{
+	int err;
+
+	err = create_netkit_named(netkit_name, netkit_peer, mode, policy,
+				  peer_policy, ifindex, scrub, peer_scrub,
+				  flags);
+	if (err)
+		return err;
+
 	ASSERT_OK(system("ip netns add foo"), "create netns");
 	ASSERT_OK(system("ip link set dev " netkit_name " up"),
 			 "up primary");
@@ -181,6 +210,81 @@ out:
 static int send_icmp(void)
 {
 	return __send_icmp(ping_addr_neigh);
+}
+
+static int send_udp_to_peer(__u16 port, const void *buf, size_t len)
+{
+	struct sockaddr_in addr = {};
+	int sock, ret;
+
+	sock = socket(AF_INET, SOCK_DGRAM, 0);
+	if (!ASSERT_GE(sock, 0, "udp_socket"))
+		return -errno;
+
+	ret = setsockopt(sock, SOL_SOCKET, SO_BINDTODEVICE,
+			 netkit_name, strlen(netkit_name) + 1);
+	if (!ASSERT_OK(ret, "setsockopt(SO_BINDTODEVICE)"))
+		goto out;
+
+	addr.sin_family = AF_INET;
+	addr.sin_port = htons(port);
+	addr.sin_addr.s_addr = htonl(ping_addr_neigh);
+
+	ret = sendto(sock, buf, len, 0, (struct sockaddr *)&addr, sizeof(addr));
+	if (!ASSERT_EQ(ret, len, "udp_sendto"))
+		ret = ret < 0 ? -errno : -EIO;
+	else
+		ret = 0;
+out:
+	close(sock);
+	return ret;
+}
+
+static int send_udp_to_dev(const char *dev, __u32 dest, __u16 port,
+			   const void *buf, size_t len)
+{
+	struct sockaddr_in addr = {};
+	int sock, ret;
+
+	sock = socket(AF_INET, SOCK_DGRAM, 0);
+	if (!ASSERT_GE(sock, 0, "udp_socket"))
+		return -errno;
+
+	ret = setsockopt(sock, SOL_SOCKET, SO_BINDTODEVICE,
+			 dev, strlen(dev) + 1);
+	if (!ASSERT_OK(ret, "setsockopt(SO_BINDTODEVICE)"))
+		goto out;
+
+	addr.sin_family = AF_INET;
+	addr.sin_port = htons(port);
+	addr.sin_addr.s_addr = htonl(dest);
+
+	ret = sendto(sock, buf, len, 0, (struct sockaddr *)&addr, sizeof(addr));
+	if (!ASSERT_EQ(ret, len, "udp_sendto"))
+		ret = ret < 0 ? -errno : -EIO;
+	else
+		ret = 0;
+out:
+	close(sock);
+	return ret;
+}
+
+static int recv_udp(int fd, void *buf, size_t len)
+{
+	ssize_t ret;
+
+	ret = recvfrom(fd, buf, len, 0, NULL, NULL);
+	if (!ASSERT_EQ(ret, len, "udp_recvfrom"))
+		return ret < 0 ? -errno : -EIO;
+	return 0;
+}
+
+static void cleanup_redirect_peer_topology(void)
+{
+	system("ip link del dev " NETKIT_A_DEV " 2>/dev/null");
+	system("ip link del dev " NETKIT_B_DEV " 2>/dev/null");
+	system("ip netns del " NETKIT_NS_FOO " 2>/dev/null");
+	system("ip netns del " NETKIT_NS_BAR " 2>/dev/null");
 }
 
 void serial_test_tc_netkit_basic(void)
@@ -867,4 +971,187 @@ void serial_test_tc_netkit_scrub(void)
 {
 	serial_test_tc_netkit_scrub_type(NETKIT_SCRUB_DEFAULT, false);
 	serial_test_tc_netkit_scrub_type(NETKIT_SCRUB_NONE, true);
+}
+
+void serial_test_tc_netkit_sk_assign(void)
+{
+	LIBBPF_OPTS(bpf_netkit_opts, optl);
+	struct sockaddr_in *addr4;
+	struct network_helper_opts opts = {
+		.timeout_ms = 3000,
+	};
+	struct test_tc_netkit_sk_assign *skel;
+	struct sockaddr_storage addr = {};
+	struct nstoken *nstoken = NULL;
+	struct bpf_link *link;
+	char buf[] = "netkit";
+	char recv_buf[sizeof(buf)];
+	const int zero = 0;
+	int server = -1;
+	int err, ifindex;
+
+	err = create_netkit(NETKIT_L3, NETKIT_PASS, NETKIT_PASS,
+			    &ifindex, NETKIT_SCRUB_DEFAULT,
+			    NETKIT_SCRUB_DEFAULT, 0);
+	if (err)
+		return;
+
+	nstoken = open_netns("foo");
+	if (!ASSERT_OK_PTR(nstoken, "open_netns"))
+		goto cleanup;
+
+	addr4 = (struct sockaddr_in *)&addr;
+	memset(addr4, 0, sizeof(*addr4));
+	addr4->sin_family = AF_INET;
+	addr4->sin_port = htons(1234);
+	addr4->sin_addr.s_addr = htonl(ping_addr_neigh);
+	server = start_server_addr(SOCK_DGRAM, &addr, sizeof(struct sockaddr_in), &opts);
+	if (!ASSERT_OK_FD(server, "start_server_addr"))
+		goto cleanup;
+
+	close_netns(nstoken);
+	nstoken = NULL;
+
+	skel = test_tc_netkit_sk_assign__open();
+	if (!ASSERT_OK_PTR(skel, "skel_open"))
+		goto cleanup;
+
+	ASSERT_EQ(bpf_program__set_expected_attach_type(skel->progs.tc_netkit_sk_assign,
+		  BPF_NETKIT_PEER), 0, "sk_assign_attach_type");
+
+	err = test_tc_netkit_sk_assign__load(skel);
+	if (!ASSERT_OK(err, "skel_load"))
+		goto cleanup_skel;
+
+	err = bpf_map_update_elem(bpf_map__fd(skel->maps.server_map), &zero, &server, 0);
+	if (!ASSERT_OK(err, "map_update"))
+		goto cleanup_skel;
+
+	link = bpf_program__attach_netkit(skel->progs.tc_netkit_sk_assign, ifindex, &optl);
+	if (!ASSERT_OK_PTR(link, "link_attach"))
+		goto cleanup_skel;
+
+	skel->links.tc_netkit_sk_assign = link;
+
+	err = send_udp_to_peer(4321, buf, sizeof(buf));
+	if (!ASSERT_OK(err, "send_udp_to_peer"))
+		goto cleanup_skel;
+
+	err = recv_udp(server, recv_buf, sizeof(recv_buf));
+	if (!ASSERT_OK(err, "recv_udp"))
+		goto cleanup_skel;
+
+	ASSERT_EQ(memcmp(buf, recv_buf, sizeof(buf)), 0, "payload");
+
+cleanup_skel:
+	test_tc_netkit_sk_assign__destroy(skel);
+cleanup:
+	if (nstoken)
+		close_netns(nstoken);
+	if (server >= 0)
+		close(server);
+	destroy_netkit();
+}
+
+void serial_test_tc_netkit_redirect_peer(void)
+{
+	LIBBPF_OPTS(bpf_netkit_opts, optl);
+	struct network_helper_opts opts = {
+		.timeout_ms = 3000,
+	};
+	struct test_tc_peer *skel = NULL;
+	struct sockaddr_storage addr = {};
+	struct sockaddr_in *addr4;
+	struct nstoken *nstoken = NULL;
+	struct bpf_link *link;
+	char buf[] = "redir";
+	char recv_buf[sizeof(buf)];
+	int ifindex_a = 0, ifindex_b = 0;
+	int server = -1;
+	int err;
+
+	cleanup_redirect_peer_topology();
+
+	err = create_netkit_named(NETKIT_A_DEV, NETKIT_A_PEER,
+				  NETKIT_L3, NETKIT_PASS, NETKIT_PASS,
+				  &ifindex_a, NETKIT_SCRUB_DEFAULT,
+				  NETKIT_SCRUB_DEFAULT, 0);
+	if (!ASSERT_OK(err, "create_netkit_a"))
+		goto cleanup;
+	err = create_netkit_named(NETKIT_B_DEV, NETKIT_B_PEER,
+				  NETKIT_L3, NETKIT_PASS, NETKIT_PASS,
+				  &ifindex_b, NETKIT_SCRUB_DEFAULT,
+				  NETKIT_SCRUB_DEFAULT, 0);
+	if (!ASSERT_OK(err, "create_netkit_b"))
+		goto cleanup;
+
+	ASSERT_OK(system("ip netns add " NETKIT_NS_FOO), "create netns foo");
+	ASSERT_OK(system("ip netns add " NETKIT_NS_BAR), "create netns bar");
+
+	ASSERT_OK(system("ip link set dev " NETKIT_A_DEV " up"), "up nk1");
+	ASSERT_OK(system("ip link set dev " NETKIT_B_DEV " up"), "up mk1");
+	ASSERT_OK(system("ip addr add dev " NETKIT_A_DEV " 10.0.0.1/24"), "addr nk1");
+	ASSERT_OK(system("ip addr add dev " NETKIT_B_DEV " 10.0.1.1/24"), "addr mk1");
+	ASSERT_OK(system("ip route add 10.0.1.2/32 dev " NETKIT_A_DEV), "route to mk0");
+
+	ASSERT_OK(system("ip link set " NETKIT_A_PEER " netns " NETKIT_NS_FOO), "move nk0");
+	ASSERT_OK(system("ip netns exec " NETKIT_NS_FOO " ip link set dev " NETKIT_A_PEER " up"), "up nk0");
+	ASSERT_OK(system("ip netns exec " NETKIT_NS_FOO " ip addr add dev " NETKIT_A_PEER " 10.0.0.2/24"), "addr nk0");
+
+	ASSERT_OK(system("ip link set " NETKIT_B_PEER " netns " NETKIT_NS_BAR), "move mk0");
+	ASSERT_OK(system("ip netns exec " NETKIT_NS_BAR " ip link set dev " NETKIT_B_PEER " up"), "up mk0");
+	ASSERT_OK(system("ip netns exec " NETKIT_NS_BAR " ip addr add dev " NETKIT_B_PEER " 10.0.1.2/24"), "addr mk0");
+
+	nstoken = open_netns(NETKIT_NS_BAR);
+	if (!ASSERT_OK_PTR(nstoken, "open_netns"))
+		goto cleanup;
+
+	addr4 = (struct sockaddr_in *)&addr;
+	memset(addr4, 0, sizeof(*addr4));
+	addr4->sin_family = AF_INET;
+	addr4->sin_port = htons(1234);
+	addr4->sin_addr.s_addr = htonl(NETKIT_B_PEER_IP);
+	server = start_server_addr(SOCK_DGRAM, &addr, sizeof(struct sockaddr_in), &opts);
+	if (!ASSERT_OK_FD(server, "start_server_addr"))
+		goto cleanup;
+
+	close_netns(nstoken);
+	nstoken = NULL;
+
+	skel = test_tc_peer__open();
+	if (!ASSERT_OK_PTR(skel, "skel_open"))
+		goto cleanup;
+
+	skel->rodata->IFINDEX_DST = ifindex_b;
+	err = bpf_program__set_expected_attach_type(skel->progs.tc_src,
+						    BPF_NETKIT_PEER);
+	if (!ASSERT_OK(err, "attach_type"))
+		goto cleanup;
+
+	err = test_tc_peer__load(skel);
+	if (!ASSERT_OK(err, "skel_load"))
+		goto cleanup;
+
+	link = bpf_program__attach_netkit(skel->progs.tc_src, ifindex_a, &optl);
+	if (!ASSERT_OK_PTR(link, "link_attach"))
+		goto cleanup;
+	skel->links.tc_src = link;
+
+	err = send_udp_to_dev(NETKIT_A_DEV, NETKIT_B_PEER_IP, 1234, buf, sizeof(buf));
+	if (!ASSERT_OK(err, "send_udp_to_dev"))
+		goto cleanup;
+
+	err = recv_udp(server, recv_buf, sizeof(recv_buf));
+	if (!ASSERT_OK(err, "recv_udp"))
+		goto cleanup;
+
+	ASSERT_EQ(memcmp(buf, recv_buf, sizeof(buf)), 0, "payload");
+
+cleanup:
+	test_tc_peer__destroy(skel);
+	if (nstoken)
+		close_netns(nstoken);
+	if (server >= 0)
+		close(server);
+	cleanup_redirect_peer_topology();
 }
