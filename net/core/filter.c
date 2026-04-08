@@ -7701,8 +7701,6 @@ BPF_CALL_3(bpf_sk_assign, struct sk_buff *, skb, struct sock *, sk, u64, flags)
 {
 	if (!sk || flags != 0)
 		return -EINVAL;
-	if (!skb_at_tc_ingress(skb))
-		return -EOPNOTSUPP;
 	if (unlikely(dev_net(skb->dev) != sock_net(sk)))
 		return -ENETUNREACH;
 	if (sk_unhashed(sk))
@@ -12234,9 +12232,6 @@ __bpf_kfunc int bpf_sk_assign_tcp_reqsk(struct __sk_buff *s, struct sock *sk,
 
 	if (attrs__sz != sizeof(*attrs) ||
 	    attrs->reserved[0] || attrs->reserved[1] || attrs->reserved[2])
-		return -EINVAL;
-
-	if (!skb_at_tc_ingress(skb))
 		return -EINVAL;
 
 	net = dev_net(skb->dev);
