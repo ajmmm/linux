@@ -340,6 +340,24 @@ static unsigned long gro_list_prepare_tc_ext(const struct sk_buff *skb,
 	return diffs;
 }
 
+static unsigned long gro_list_prepare_deliver_sk_ext(const struct sk_buff *skb,
+						     const struct sk_buff *p,
+						     unsigned long diffs)
+{
+#if IS_ENABLED(CONFIG_INET)
+	struct skb_deliver_sk *skb_ext;
+	struct skb_deliver_sk *p_ext;
+
+	skb_ext = skb_ext_find(skb, SKB_EXT_DELIVER_SK);
+	p_ext = skb_ext_find(p, SKB_EXT_DELIVER_SK);
+
+	diffs |= (!!p_ext) ^ (!!skb_ext);
+	if (!diffs && unlikely(skb_ext))
+		diffs |= (unsigned long)p_ext->sk ^ (unsigned long)skb_ext->sk;
+#endif
+	return diffs;
+}
+
 static void gro_list_prepare(const struct list_head *head,
 			     const struct sk_buff *skb)
 {
@@ -376,6 +394,7 @@ static void gro_list_prepare(const struct list_head *head,
 			diffs |= skb_metadata_dst_cmp(p, skb);
 			diffs |= skb_get_nfct(p) ^ skb_get_nfct(skb);
 
+			diffs |= gro_list_prepare_deliver_sk_ext(skb, p, diffs);
 			diffs |= gro_list_prepare_tc_ext(skb, p, diffs);
 			diffs |= __psp_skb_coalesce_diff(skb, p, diffs);
 		}

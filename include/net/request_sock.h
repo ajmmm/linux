@@ -93,7 +93,27 @@ static inline struct sock *req_to_sk(struct request_sock *req)
 static inline struct sock *skb_steal_sock(struct sk_buff *skb,
 					  bool *refcounted, bool *prefetched)
 {
-	struct sock *sk = skb->sk;
+	struct sock *sk = skb_deliver_sk(skb);
+
+	if (sk) {
+		*prefetched = true;
+#if IS_ENABLED(CONFIG_SYN_COOKIES)
+		if (sk->sk_state == TCP_NEW_SYN_RECV && inet_reqsk(sk)->syncookie) {
+			struct request_sock *req = inet_reqsk(sk);
+
+			*refcounted = false;
+			sk = req->rsk_listener;
+			req->rsk_listener = NULL;
+			skb_clear_deliver_sk(skb);
+			return sk;
+		}
+#endif
+		*refcounted = sk_is_refcounted(sk);
+		skb_clear_deliver_sk(skb);
+		return sk;
+	}
+
+	sk = skb->sk;
 
 	if (!sk) {
 		*prefetched = false;

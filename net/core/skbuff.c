@@ -1195,6 +1195,15 @@ void skb_release_head_state(struct sk_buff *skb)
 	skb_ext_reset(skb);
 }
 
+void skb_drop_deliver_sk(struct sk_buff *skb)
+{
+#if IS_ENABLED(CONFIG_INET)
+	if (skb_ext_exist(skb, SKB_EXT_DELIVER_SK))
+		skb_ext_del(skb, SKB_EXT_DELIVER_SK);
+#endif
+}
+EXPORT_SYMBOL(skb_drop_deliver_sk);
+
 /* Free everything but the sk_buff shell. */
 static void skb_release_all(struct sk_buff *skb, enum skb_drop_reason reason)
 {
@@ -5131,6 +5140,9 @@ static const u8 skb_ext_type_len[] = {
 #if IS_ENABLED(CONFIG_NET_TC_SKB_EXT)
 	[TC_SKB_EXT] = SKB_EXT_CHUNKSIZEOF(struct tc_skb_ext),
 #endif
+#if IS_ENABLED(CONFIG_INET)
+	[SKB_EXT_DELIVER_SK] = SKB_EXT_CHUNKSIZEOF(struct skb_deliver_sk),
+#endif
 #if IS_ENABLED(CONFIG_MPTCP)
 	[SKB_EXT_MPTCP] = SKB_EXT_CHUNKSIZEOF(struct mptcp_ext),
 #endif
@@ -7209,6 +7221,27 @@ static void skb_ext_put_mctp(struct mctp_flow *flow)
 }
 #endif
 
+#ifdef CONFIG_INET
+static void skb_ext_put_deliver_sk(struct skb_deliver_sk *deliver)
+{
+	struct sock *sk = deliver->sk;
+
+	if (!sk)
+		return;
+
+	if (!sk_is_refcounted(sk))
+		return;
+
+	if (sk->sk_state == TCP_NEW_SYN_RECV && inet_reqsk(sk)->syncookie) {
+		inet_reqsk(sk)->rsk_listener = NULL;
+		reqsk_free(inet_reqsk(sk));
+		return;
+	}
+
+	sock_gen_put(sk);
+}
+#endif
+
 void __skb_ext_del(struct sk_buff *skb, enum skb_ext_id id)
 {
 	struct skb_ext *ext = skb->extensions;
@@ -7224,6 +7257,15 @@ void __skb_ext_del(struct sk_buff *skb, enum skb_ext_id id)
 
 		skb_ext_put_sp(sp);
 		sp->len = 0;
+#endif
+#ifdef CONFIG_INET
+	} else if (id == SKB_EXT_DELIVER_SK &&
+		   refcount_read(&ext->refcnt) == 1) {
+		struct skb_deliver_sk *deliver;
+
+		deliver = skb_ext_get_ptr(ext, SKB_EXT_DELIVER_SK);
+		skb_ext_put_deliver_sk(deliver);
+		deliver->sk = NULL;
 #endif
 	}
 }
@@ -7243,6 +7285,10 @@ free_now:
 #ifdef CONFIG_XFRM
 	if (__skb_ext_exist(ext, SKB_EXT_SEC_PATH))
 		skb_ext_put_sp(skb_ext_get_ptr(ext, SKB_EXT_SEC_PATH));
+#endif
+#ifdef CONFIG_INET
+	if (__skb_ext_exist(ext, SKB_EXT_DELIVER_SK))
+		skb_ext_put_deliver_sk(skb_ext_get_ptr(ext, SKB_EXT_DELIVER_SK));
 #endif
 #ifdef CONFIG_MCTP_FLOWS
 	if (__skb_ext_exist(ext, SKB_EXT_MCTP))

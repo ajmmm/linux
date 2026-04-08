@@ -7712,10 +7712,7 @@ BPF_CALL_3(bpf_sk_assign, struct sk_buff *, skb, struct sock *, sk, u64, flags)
 		return -ENOENT;
 
 	skb_orphan(skb);
-	skb->sk = sk;
-	skb->destructor = sock_pfree;
-
-	return 0;
+	return skb_set_deliver_sk(skb, sk);
 }
 
 static const struct bpf_func_proto bpf_sk_assign_proto = {
@@ -12310,10 +12307,7 @@ __bpf_kfunc int bpf_sk_assign_tcp_reqsk(struct __sk_buff *s, struct sock *sk,
 	treq->ts_off = tsoff;
 
 	skb_orphan(skb);
-	skb->sk = req_to_sk(req);
-	skb->destructor = sock_pfree;
-
-	return 0;
+	return skb_set_deliver_sk(skb, req_to_sk(req));
 #else
 	return -EOPNOTSUPP;
 #endif

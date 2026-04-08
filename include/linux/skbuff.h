@@ -282,6 +282,7 @@ struct napi_struct;
 struct bpf_prog;
 union bpf_attr;
 struct skb_ext;
+struct sock;
 struct ts_config;
 
 #if IS_ENABLED(CONFIG_BRIDGE_NETFILTER)
@@ -331,6 +332,12 @@ struct tc_skb_ext {
 	u8 post_ct_dnat:1;
 	u8 act_miss:1; /* Set if act_miss_cookie is used */
 	u8 l2_miss:1; /* Set by bridge upon FDB or MDB miss */
+};
+#endif
+
+#if IS_ENABLED(CONFIG_INET)
+struct skb_deliver_sk {
+	struct sock *sk;
 };
 #endif
 
@@ -1353,6 +1360,7 @@ static inline void consume_skb(struct sk_buff *skb)
 
 void __consume_stateless_skb(struct sk_buff *skb);
 void  __kfree_skb(struct sk_buff *skb);
+void skb_drop_deliver_sk(struct sk_buff *skb);
 
 void kfree_skb_partial(struct sk_buff *skb, bool head_stolen);
 bool skb_try_coalesce(struct sk_buff *to, struct sk_buff *from,
@@ -4995,6 +5003,9 @@ enum skb_ext_id {
 #endif
 #if IS_ENABLED(CONFIG_MPTCP)
 	SKB_EXT_MPTCP,
+#endif
+#if IS_ENABLED(CONFIG_INET)
+	SKB_EXT_DELIVER_SK,
 #endif
 #if IS_ENABLED(CONFIG_MCTP_FLOWS)
 	SKB_EXT_MCTP,

@@ -2978,11 +2978,58 @@ static inline bool
 skb_sk_is_prefetched(struct sk_buff *skb)
 {
 #ifdef CONFIG_INET
-	return skb->destructor == sock_pfree;
+	return skb->destructor == sock_pfree ||
+	       skb_ext_exist(skb, SKB_EXT_DELIVER_SK);
 #else
 	return false;
 #endif /* CONFIG_INET */
 }
+
+#ifdef CONFIG_INET
+static inline struct sock *skb_deliver_sk(const struct sk_buff *skb)
+{
+	struct skb_deliver_sk *ext;
+
+	ext = skb_ext_find(skb, SKB_EXT_DELIVER_SK);
+	return ext ? ext->sk : NULL;
+}
+
+static inline int skb_set_deliver_sk(struct sk_buff *skb, struct sock *sk)
+{
+	struct skb_deliver_sk *ext;
+
+	ext = skb_ext_add(skb, SKB_EXT_DELIVER_SK);
+	if (!ext)
+		return -ENOMEM;
+
+	ext->sk = sk;
+	return 0;
+}
+
+static inline void skb_clear_deliver_sk(struct sk_buff *skb)
+{
+	struct skb_deliver_sk *ext;
+
+	ext = skb_ext_add(skb, SKB_EXT_DELIVER_SK);
+	if (!ext)
+		return;
+
+	ext->sk = NULL;
+	skb_ext_del(skb, SKB_EXT_DELIVER_SK);
+}
+#else
+static inline struct sock *skb_deliver_sk(const struct sk_buff *skb)
+{
+	return NULL;
+}
+
+static inline int skb_set_deliver_sk(struct sk_buff *skb, struct sock *sk)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline void skb_clear_deliver_sk(struct sk_buff *skb) {}
+#endif /* CONFIG_INET */
 
 /* This helper checks if a socket is a full socket,
  * ie _not_ a timewait or request socket.
