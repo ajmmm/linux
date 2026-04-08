@@ -26,7 +26,7 @@
 static int stop, duration;
 
 static bool
-configure_stack(void)
+attach_tc_filter(bool ingress)
 {
 	char tc_version[128];
 	char tc_cmd[BUFSIZ];
@@ -48,6 +48,22 @@ configure_stack(void)
 	if (CHECK_FAIL(pclose(tc)))
 		return false;
 
+	sprintf(tc_cmd, "%s %s %s %s %s", ingress ?
+		       "tc filter add dev lo ingress bpf" :
+		       "tc filter add dev lo egress bpf",
+		       "direct-action object-file", prog,
+		       "section tc",
+		       (env.verbosity < VERBOSE_VERY) ? " 2>/dev/null" : "verbose");
+	if (CHECK(system(tc_cmd), "BPF load failed;",
+		  "run with -vv for more info\n"))
+		return false;
+
+	return true;
+}
+
+static bool
+configure_stack(bool ingress)
+{
 	/* Move to a new networking namespace */
 	if (CHECK_FAIL(unshare(CLONE_NEWNET)))
 		return false;
@@ -63,15 +79,7 @@ configure_stack(void)
 	/* Load qdisc, BPF program */
 	if (CHECK_FAIL(system("tc qdisc add dev lo clsact")))
 		return false;
-	sprintf(tc_cmd, "%s %s %s %s %s", "tc filter add dev lo ingress bpf",
-		       "direct-action object-file", prog,
-		       "section tc",
-		       (env.verbosity < VERBOSE_VERY) ? " 2>/dev/null" : "verbose");
-	if (CHECK(system(tc_cmd), "BPF load failed;",
-		  "run with -vv for more info\n"))
-		return false;
-
-	return true;
+	return attach_tc_filter(ingress);
 }
 
 static in_port_t
@@ -206,9 +214,10 @@ struct test_sk_cfg {
 	socklen_t len;
 	int type;
 	bool rewrite_addr;
+	bool ingress;
 };
 
-#define TEST(NAME, FAMILY, TYPE, REWRITE)				\
+#define TEST(NAME, FAMILY, TYPE, REWRITE, INGRESS)			\
 {									\
 	.name = NAME,							\
 	.family = FAMILY,						\
@@ -217,6 +226,7 @@ struct test_sk_cfg {
 	.len = (FAMILY == AF_INET) ? sizeof(addr4) : sizeof(addr6),	\
 	.type = TYPE,							\
 	.rewrite_addr = REWRITE,					\
+	.ingress = INGRESS,						\
 }
 
 void test_sk_assign(void)
@@ -224,19 +234,28 @@ void test_sk_assign(void)
 	struct sockaddr_in addr4;
 	struct sockaddr_in6 addr6;
 	struct test_sk_cfg tests[] = {
-		TEST("ipv4 tcp port redir", AF_INET, SOCK_STREAM, false),
-		TEST("ipv4 tcp addr redir", AF_INET, SOCK_STREAM, true),
-		TEST("ipv6 tcp port redir", AF_INET6, SOCK_STREAM, false),
-		TEST("ipv6 tcp addr redir", AF_INET6, SOCK_STREAM, true),
-		TEST("ipv4 udp port redir", AF_INET, SOCK_DGRAM, false),
-		TEST("ipv4 udp addr redir", AF_INET, SOCK_DGRAM, true),
-		TEST("ipv6 udp port redir", AF_INET6, SOCK_DGRAM, false),
-		TEST("ipv6 udp addr redir", AF_INET6, SOCK_DGRAM, true),
+		TEST("ipv4 tcp port redir ingress", AF_INET, SOCK_STREAM, false, true),
+		TEST("ipv4 tcp addr redir ingress", AF_INET, SOCK_STREAM, true, true),
+		TEST("ipv6 tcp port redir ingress", AF_INET6, SOCK_STREAM, false, true),
+		TEST("ipv6 tcp addr redir ingress", AF_INET6, SOCK_STREAM, true, true),
+		TEST("ipv4 udp port redir ingress", AF_INET, SOCK_DGRAM, false, true),
+		TEST("ipv4 udp addr redir ingress", AF_INET, SOCK_DGRAM, true, true),
+		TEST("ipv6 udp port redir ingress", AF_INET6, SOCK_DGRAM, false, true),
+		TEST("ipv6 udp addr redir ingress", AF_INET6, SOCK_DGRAM, true, true),
+		TEST("ipv4 tcp port redir egress", AF_INET, SOCK_STREAM, false, false),
+		TEST("ipv4 tcp addr redir egress", AF_INET, SOCK_STREAM, true, false),
+		TEST("ipv6 tcp port redir egress", AF_INET6, SOCK_STREAM, false, false),
+		TEST("ipv6 tcp addr redir egress", AF_INET6, SOCK_STREAM, true, false),
+		TEST("ipv4 udp port redir egress", AF_INET, SOCK_DGRAM, false, false),
+		TEST("ipv4 udp addr redir egress", AF_INET, SOCK_DGRAM, true, false),
+		TEST("ipv6 udp port redir egress", AF_INET6, SOCK_DGRAM, false, false),
+		TEST("ipv6 udp addr redir egress", AF_INET6, SOCK_DGRAM, true, false),
 	};
 	__s64 server = -1;
 	int server_map;
 	int self_net;
 	int i;
+	bool ingress = true;
 
 	self_net = open(NS_SELF, O_RDONLY);
 	if (CHECK_FAIL(self_net < 0)) {
@@ -244,7 +263,7 @@ void test_sk_assign(void)
 		return;
 	}
 
-	if (!configure_stack()) {
+	if (!configure_stack(ingress)) {
 		perror("configure_stack");
 		goto cleanup;
 	}
@@ -263,6 +282,25 @@ void test_sk_assign(void)
 
 		if (!test__start_subtest(test->name))
 			continue;
+
+		if (test->ingress != ingress) {
+			close(server_map);
+			if (CHECK_FAIL(system("tc qdisc del dev lo clsact")))
+				goto cleanup;
+			if (CHECK_FAIL(system("tc qdisc add dev lo clsact")))
+				goto cleanup;
+			ingress = test->ingress;
+			if (!attach_tc_filter(ingress)) {
+				perror("attach_tc_filter");
+				goto cleanup;
+			}
+			server_map = bpf_obj_get(SERVER_MAP_PATH);
+			if (CHECK_FAIL(server_map < 0)) {
+				perror("Unable to open " SERVER_MAP_PATH);
+				goto cleanup;
+			}
+		}
+
 		prepare_addr(test->addr, test->family, BIND_PORT, false);
 		addr = (const struct sockaddr *)test->addr;
 		server = start_server_addr(test->type,
