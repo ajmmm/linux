@@ -300,10 +300,17 @@ static int cookie_tcp_reqsk_init(struct sock *sk, struct sk_buff *skb,
 #if IS_ENABLED(CONFIG_BPF)
 struct request_sock *cookie_bpf_check(struct sock *sk, struct sk_buff *skb)
 {
-	struct request_sock *req = inet_reqsk(skb->sk);
+	struct sock *req_sk = skb_deliver_sk(skb);
+	struct request_sock *req;
 
-	skb->sk = NULL;
-	skb->destructor = NULL;
+	if (req_sk) {
+		req = inet_reqsk(req_sk);
+		skb_clear_deliver_sk(skb);
+	} else {
+		req = inet_reqsk(skb->sk);
+		skb->sk = NULL;
+		skb->destructor = NULL;
+	}
 
 	if (cookie_tcp_reqsk_init(sk, skb, req)) {
 		reqsk_free(req);
