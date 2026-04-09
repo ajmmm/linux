@@ -9,11 +9,13 @@
  */
 
 #define _GNU_SOURCE
+#include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <stdlib.h>
 #include <unistd.h>
 
+#include "test_sk_assign_lifetime.skel.h"
 #include "test_progs.h"
 #include "network_helpers.h"
 
@@ -22,6 +24,10 @@
 #define TEST_DADDR (0xC0A80203)
 #define NS_SELF "/proc/self/ns/net"
 #define SERVER_MAP_PATH "/sys/fs/bpf/tc/globals/server_map"
+#define SRC_DEV "sk_assign_src0"
+#define DST_DEV "sk_assign_dst0"
+#define SRC_ADDR "10.0.0.1"
+#define DST_ADDR "10.0.0.2"
 
 static int stop, duration;
 
@@ -229,6 +235,223 @@ struct test_sk_cfg {
 	.ingress = INGRESS,						\
 }
 
+static void close_fd(int *fd)
+{
+	if (*fd >= 0) {
+		close(*fd);
+		*fd = -1;
+	}
+}
+
+static bool configure_tc_dev(const char *dev)
+{
+	char cmd[128];
+
+	snprintf(cmd, sizeof(cmd), "ip link set dev %s up", dev);
+	return ASSERT_OK(system(cmd), "link_up");
+}
+
+static bool update_server_map(struct test_sk_assign_lifetime *skel, int fd)
+{
+	const int zero = 0;
+
+	return ASSERT_OK(bpf_map_update_elem(bpf_map__fd(skel->maps.server_map),
+					     &zero, &fd, 0), "map_update");
+}
+
+static bool run_drop_after_assign_test(bool ingress)
+{
+	struct test_sk_assign_lifetime *skel = NULL;
+	struct network_helper_opts opts = {
+		.timeout_ms = 100,
+	};
+	struct sockaddr_storage addr;
+	socklen_t addrlen;
+	char buf[32];
+	const char payload[] = "drop-after-assign";
+	int orig_net = -1, server_fd = -1, client_fd = -1;
+	ssize_t err;
+	bool ok = false;
+
+	orig_net = open(NS_SELF, O_RDONLY);
+	if (!ASSERT_GE(orig_net, 0, "open_self_net"))
+		return false;
+
+	if (CHECK_FAIL(unshare(CLONE_NEWNET)))
+		goto out;
+	if (!ASSERT_OK(system("ip link set dev lo up"), "link_up"))
+		goto out;
+	if (!ASSERT_OK(system("ip route add local default dev lo"), "route_v4"))
+		goto out;
+
+	skel = test_sk_assign_lifetime__open_and_load();
+	if (!ASSERT_OK_PTR(skel, "open_and_load"))
+		goto out;
+
+	if (!ASSERT_OK(tc_prog_attach("lo",
+				      ingress ? bpf_program__fd(skel->progs.sk_assign_drop) : -1,
+				      ingress ? -1 : bpf_program__fd(skel->progs.sk_assign_drop)),
+		       "tc_prog_attach"))
+		goto out;
+
+	server_fd = start_server_str(AF_INET, SOCK_DGRAM, "127.0.0.1", BIND_PORT, &opts);
+	if (!ASSERT_GE(server_fd, 0, "start_server"))
+		goto out;
+	if (!update_server_map(skel, server_fd))
+		goto out;
+
+	if (!ASSERT_OK(make_sockaddr(AF_INET, "127.0.0.1", CONNECT_PORT, &addr, &addrlen),
+		       "make_sockaddr"))
+		goto out;
+	client_fd = connect_to_addr(SOCK_DGRAM, &addr, addrlen, &opts);
+	if (!ASSERT_GE(client_fd, 0, "connect"))
+		goto out;
+
+	if (!ASSERT_EQ(write(client_fd, payload, sizeof(payload)), sizeof(payload), "write"))
+		goto out;
+
+	err = recvfrom(server_fd, buf, sizeof(buf), 0, NULL, NULL);
+	if (!ASSERT_EQ(err, -1, "recv_timeout"))
+		goto out;
+	if (!ASSERT_EQ(errno, EAGAIN, "recv_errno"))
+		goto out;
+
+	ok = true;
+out:
+	close_fd(&client_fd);
+	close_fd(&server_fd);
+	test_sk_assign_lifetime__destroy(skel);
+	if (orig_net >= 0) {
+		if (!ASSERT_OK(setns(orig_net, CLONE_NEWNET), "restore_netns"))
+			ok = false;
+		close(orig_net);
+	}
+	return ok;
+}
+
+static bool run_egress_orphan_test(void)
+{
+	struct test_sk_assign_lifetime *skel = NULL;
+	struct network_helper_opts opts = {
+		.timeout_ms = 100,
+	};
+	struct nstoken *token = NULL;
+	struct sockaddr_storage addr;
+	socklen_t addrlen;
+	char src_ns[64] = "sk_assign_src";
+	char dst_ns[64] = "sk_assign_dst";
+	char buf[32];
+	const char payload[] = "egress-orphan";
+	int assigned_fd = -1, client_fd = -1, remote_fd = -1;
+	ssize_t err;
+	bool ok = false;
+	char cmd[256];
+
+	if (!ASSERT_OK(append_tid(src_ns, sizeof(src_ns)), "append_src_tid"))
+		return false;
+	if (!ASSERT_OK(append_tid(dst_ns, sizeof(dst_ns)), "append_dst_tid"))
+		return false;
+
+	snprintf(cmd, sizeof(cmd), "ip netns del %s >/dev/null 2>&1", src_ns);
+	system(cmd);
+	snprintf(cmd, sizeof(cmd), "ip netns del %s >/dev/null 2>&1", dst_ns);
+	system(cmd);
+	snprintf(cmd, sizeof(cmd), "ip link del %s >/dev/null 2>&1", SRC_DEV);
+	system(cmd);
+
+	if (!ASSERT_OK(make_netns(src_ns), "make_src_ns"))
+		return false;
+	if (!ASSERT_OK(make_netns(dst_ns), "make_dst_ns"))
+		goto out;
+
+	snprintf(cmd, sizeof(cmd),
+		 "ip link add %s netns %s type veth peer name %s netns %s",
+		 SRC_DEV, src_ns, DST_DEV, dst_ns);
+	if (!ASSERT_OK(system(cmd), "add_veth"))
+		goto out;
+
+	snprintf(cmd, sizeof(cmd), "ip -n %s addr add %s/24 dev %s", src_ns, SRC_ADDR, SRC_DEV);
+	if (!ASSERT_OK(system(cmd), "src_addr"))
+		goto out;
+	snprintf(cmd, sizeof(cmd), "ip -n %s link set dev %s up", src_ns, SRC_DEV);
+	if (!ASSERT_OK(system(cmd), "src_up"))
+		goto out;
+	snprintf(cmd, sizeof(cmd), "ip -n %s addr add %s/24 dev %s", dst_ns, DST_ADDR, DST_DEV);
+	if (!ASSERT_OK(system(cmd), "dst_addr"))
+		goto out;
+	snprintf(cmd, sizeof(cmd), "ip -n %s link set dev %s up", dst_ns, DST_DEV);
+	if (!ASSERT_OK(system(cmd), "dst_up"))
+		goto out;
+	snprintf(cmd, sizeof(cmd), "ip -n %s route add %s/32 dev %s", src_ns, DST_ADDR, SRC_DEV);
+	if (!ASSERT_OK(system(cmd), "src_route"))
+		goto out;
+
+	token = open_netns(src_ns);
+	if (!ASSERT_OK_PTR(token, "open_src_ns"))
+		goto out;
+	if (!configure_tc_dev(SRC_DEV))
+		goto out;
+
+	skel = test_sk_assign_lifetime__open_and_load();
+	if (!ASSERT_OK_PTR(skel, "open_and_load"))
+		goto out;
+	if (!ASSERT_OK(tc_prog_attach(SRC_DEV, -1, bpf_program__fd(skel->progs.sk_assign_pass)),
+		       "tc_prog_attach"))
+		goto out;
+
+	assigned_fd = start_server_str(AF_INET, SOCK_DGRAM, SRC_ADDR, BIND_PORT, &opts);
+	if (!ASSERT_GE(assigned_fd, 0, "start_assigned_server"))
+		goto out;
+	if (!update_server_map(skel, assigned_fd))
+		goto out;
+
+	if (!ASSERT_OK(make_sockaddr(AF_INET, DST_ADDR, CONNECT_PORT, &addr, &addrlen),
+		       "make_dst_addr"))
+		goto out;
+	client_fd = connect_to_addr(SOCK_DGRAM, &addr, addrlen, &opts);
+	if (!ASSERT_GE(client_fd, 0, "connect"))
+		goto out;
+
+	close_netns(token);
+	token = open_netns(dst_ns);
+	if (!ASSERT_OK_PTR(token, "open_dst_ns"))
+		goto out;
+
+	remote_fd = start_server_str(AF_INET, SOCK_DGRAM, DST_ADDR, CONNECT_PORT, &opts);
+	if (!ASSERT_GE(remote_fd, 0, "start_remote_server"))
+		goto out;
+
+	close_netns(token);
+	token = NULL;
+
+	if (!ASSERT_EQ(write(client_fd, payload, sizeof(payload)), sizeof(payload), "write"))
+		goto out;
+
+	err = recvfrom(remote_fd, buf, sizeof(buf), 0, NULL, NULL);
+	if (!ASSERT_EQ(err, sizeof(payload), "recv_remote"))
+		goto out;
+
+	err = recvfrom(assigned_fd, buf, sizeof(buf), 0, NULL, NULL);
+	if (!ASSERT_EQ(err, -1, "assigned_recv_timeout"))
+		goto out;
+	if (!ASSERT_EQ(errno, EAGAIN, "assigned_recv_errno"))
+		goto out;
+
+	ok = true;
+out:
+	if (token)
+		close_netns(token);
+	close_fd(&assigned_fd);
+	close_fd(&client_fd);
+	close_fd(&remote_fd);
+	test_sk_assign_lifetime__destroy(skel);
+	snprintf(cmd, sizeof(cmd), "ip link del %s >/dev/null 2>&1", SRC_DEV);
+	system(cmd);
+	remove_netns(src_ns);
+	remove_netns(dst_ns);
+	return ok;
+}
+
 void test_sk_assign(void)
 {
 	struct sockaddr_in addr4;
@@ -328,6 +551,18 @@ void test_sk_assign(void)
 close:
 	close(server);
 	close(server_map);
+
+	if (!READ_ONCE(stop) && test__start_subtest("udp drop after assign ingress") &&
+	    !run_drop_after_assign_test(true))
+		goto cleanup;
+
+	if (!READ_ONCE(stop) && test__start_subtest("udp drop after assign egress") &&
+	    !run_drop_after_assign_test(false))
+		goto cleanup;
+
+	if (!READ_ONCE(stop) && test__start_subtest("udp egress orphan scrub") &&
+	    !run_egress_orphan_test())
+		goto cleanup;
 cleanup:
 	if (CHECK_FAIL(unlink(SERVER_MAP_PATH)))
 		perror("Unable to unlink " SERVER_MAP_PATH);
