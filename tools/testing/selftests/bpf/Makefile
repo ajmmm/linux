@@ -736,6 +736,8 @@ $(VERIFY_SIG_HDR): $(VERIFICATION_CERT)
 # Define test_progs test runner.
 TRUNNER_TESTS_DIR := prog_tests
 TRUNNER_BPF_PROGS_DIR := progs
+VMLINUX_HAS_SMC := $(shell grep -q "struct smc_hs_ctrl {" $(INCLUDE_DIR)/vmlinux.h 2>/dev/null && echo y)
+SMC_BPF_CFLAG := $(if $(VMLINUX_HAS_SMC),,-DBPF_NO_SMC)
 TRUNNER_EXTRA_SOURCES := test_progs.c		\
 			 cgroup_helpers.c	\
 			 trace_helpers.c	\
@@ -768,7 +770,7 @@ TRUNNER_EXTRA_FILES := $(OUTPUT)/urandom_read				\
 		       $(wildcard progs/btf_dump_test_case_*.c)		\
 		       $(wildcard progs/*.bpf.o)
 TRUNNER_BPF_BUILD_RULE := CLANG_BPF_BUILD_RULE
-TRUNNER_BPF_CFLAGS := $(BPF_CFLAGS) $(CLANG_CFLAGS) -DENABLE_ATOMICS_TESTS
+TRUNNER_BPF_CFLAGS := $(BPF_CFLAGS) $(CLANG_CFLAGS) -DENABLE_ATOMICS_TESTS $(SMC_BPF_CFLAG)
 $(eval $(call DEFINE_TEST_RUNNER,test_progs))
 
 # Define test_progs-no_alu32 test runner.

@@ -8,6 +8,8 @@
 
 #define __contains(name, node) __attribute__((btf_decl_tag("contains:" #name ":" #node)))
 
+struct bpf_sk_buff_ptr;
+
 /* Description
  *	Allocates an object of the type represented by 'local_type_id' in
  *	program BTF. User may use the bpf_core_type_id_local macro to pass the
@@ -220,6 +222,27 @@ extern void bpf_put_file(struct file *file) __ksym;
  *	buffer. On error, a negative integer is returned.
  */
 extern int bpf_path_d_path(const struct path *path, char *buf, size_t buf__sz) __ksym;
+
+/* Description
+ *	Drop an skb from a BPF qdisc program by queuing it on the deferred
+ *	free list passed into Qdisc_ops.enqueue.
+ */
+extern u32 bpf_skb_get_hash(struct sk_buff *skb) __ksym;
+extern void bpf_kfree_skb(struct sk_buff *skb) __ksym;
+extern void bpf_qdisc_skb_drop(struct sk_buff *skb,
+			       struct bpf_sk_buff_ptr *to_free_list) __ksym;
+
+/* Description
+ *	Schedule a BPF qdisc watchdog with a slack range in nanoseconds.
+ */
+extern void bpf_qdisc_watchdog_schedule(struct Qdisc *sch, u64 expire,
+					u64 delta_ns) __ksym;
+
+/* Description
+ *	Update a qdisc's basic statistics for a dequeued skb.
+ */
+extern void bpf_qdisc_bstats_update(struct Qdisc *sch,
+				    const struct sk_buff *skb) __ksym;
 
 /* This macro must be used to mark the exception callback corresponding to the
  * main program. For example:

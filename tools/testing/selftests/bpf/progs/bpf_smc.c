@@ -8,6 +8,37 @@
 
 char _license[] SEC("license") = "GPL";
 
+#ifdef BPF_NO_SMC
+
+int smc_cnt = 0;
+int fallback_cnt = 0;
+bool default_ip_strat_value = true;
+
+struct smc_policy_ip_key {
+	__u32	sip;
+	__u32	dip;
+};
+
+struct smc_policy_ip_value {
+	__u8	mode;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(key_size, sizeof(struct smc_policy_ip_key));
+	__uint(value_size, sizeof(struct smc_policy_ip_value));
+	__uint(max_entries, 128);
+	__uint(map_flags, BPF_F_NO_PREALLOC);
+} smc_policy_ip SEC(".maps");
+
+SEC("fmod_ret/update_socket_protocol")
+int BPF_PROG(smc_run, int family, int type, int protocol)
+{
+	return protocol;
+}
+
+#else
+
 enum {
 	BPF_SMC_LISTEN	= 10,
 };
@@ -115,3 +146,5 @@ struct smc_hs_ctrl  linkcheck = {
 	.syn_option	= (void *)bpf_smc_set_tcp_option,
 	.synack_option	= (void *)bpf_smc_set_tcp_option_cond,
 };
+
+#endif /* BPF_NO_SMC */
