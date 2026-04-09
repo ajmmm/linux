@@ -68,7 +68,8 @@ struct tcp_syncookie {
 	u64 first;
 };
 
-bool handled_syn, handled_ack;
+bool handled_syn, handled_ack, drop_ack;
+u32 assigned_reqsk, dropped_ack;
 
 static int tcp_load_headers(struct tcp_syncookie *ctx)
 {
@@ -550,6 +551,12 @@ static int tcp_handle_ack(struct tcp_syncookie *ctx)
 	ret = bpf_sk_assign_tcp_reqsk(ctx->skb, sk, &ctx->attrs, sizeof(ctx->attrs));
 	if (ret < 0)
 		goto err;
+
+	assigned_reqsk++;
+	if (drop_ack) {
+		dropped_ack++;
+		ret = TC_ACT_SHOT;
+	}
 
 release:
 	bpf_sk_release(skc);

@@ -115,6 +115,44 @@ close_server:
 	close(server);
 }
 
+static int set_low_syn_retries(int fd, void *opts)
+{
+	int syncnt = 1;
+
+	return setsockopt(fd, IPPROTO_TCP, TCP_SYNCNT, &syncnt, sizeof(syncnt));
+}
+
+static void create_connection_drop_ack(struct test_tcp_custom_syncookie_case *test_case)
+{
+	struct network_helper_opts client_opts = {
+		.timeout_ms = 250,
+		.post_socket_cb = set_low_syn_retries,
+	};
+	struct network_helper_opts server_opts = {
+		.timeout_ms = 250,
+	};
+	int server, client, child;
+
+	server = start_server_str(test_case->family, test_case->type, test_case->addr, 0,
+				  &server_opts);
+	if (!ASSERT_NEQ(server, -1, "start_server"))
+		return;
+
+	client = connect_to_fd_opts(server, &client_opts);
+	if (!ASSERT_NEQ(client, -1, "connect_to_fd"))
+		goto close_server;
+
+	child = accept(server, NULL, 0);
+	if (!ASSERT_EQ(child, -1, "accept_should_timeout"))
+		goto close_client;
+	ASSERT_EQ(errno, EAGAIN, "accept_errno");
+
+close_client:
+	close(client);
+close_server:
+	close(server);
+}
+
 void test_tcp_custom_syncookie(void)
 {
 	struct test_tcp_custom_syncookie *skel;
@@ -141,6 +179,37 @@ void test_tcp_custom_syncookie(void)
 
 		ASSERT_EQ(skel->bss->handled_syn, true, "SYN is not handled at tc.");
 		ASSERT_EQ(skel->bss->handled_ack, true, "ACK is not handled at tc");
+		ASSERT_GE(skel->bss->assigned_reqsk, 1, "reqsk assign count");
+		ASSERT_EQ(skel->bss->dropped_ack, 0, "dropped ack count");
+
+		if (!test__start_subtest("drop ack after reqsk assign"))
+			continue;
+
+		skel->bss->handled_syn = false;
+		skel->bss->handled_ack = false;
+		skel->bss->drop_ack = true;
+		skel->bss->assigned_reqsk = 0;
+		skel->bss->dropped_ack = 0;
+
+		create_connection_drop_ack(&test_cases[i]);
+
+		ASSERT_EQ(skel->bss->handled_syn, true, "dropped SYN is not handled at tc");
+		ASSERT_EQ(skel->bss->handled_ack, true, "dropped ACK is not handled at tc");
+		ASSERT_GE(skel->bss->assigned_reqsk, 1, "dropped reqsk assign count");
+		ASSERT_GE(skel->bss->dropped_ack, 1, "dropped ack count");
+
+		skel->bss->handled_syn = false;
+		skel->bss->handled_ack = false;
+		skel->bss->drop_ack = false;
+		skel->bss->assigned_reqsk = 0;
+		skel->bss->dropped_ack = 0;
+
+		create_connection(&test_cases[i]);
+
+		ASSERT_EQ(skel->bss->handled_syn, true, "recovery SYN is not handled at tc");
+		ASSERT_EQ(skel->bss->handled_ack, true, "recovery ACK is not handled at tc");
+		ASSERT_GE(skel->bss->assigned_reqsk, 1, "recovery reqsk assign count");
+		ASSERT_EQ(skel->bss->dropped_ack, 0, "recovery dropped ack count");
 	}
 
 destroy_skel:
